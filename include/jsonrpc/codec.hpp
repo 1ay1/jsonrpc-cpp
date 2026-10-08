@@ -21,6 +21,7 @@
 #pragma once
 
 #include <array>
+#include <concepts>
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
@@ -45,8 +46,35 @@ struct Codec {
     std::function<T(const Json&)> decode;
 };
 
-// Customisation point: a protocol type supplies CodecOf<T>::get().
+// The customisation point for the BUILT-IN types (bool, string, numbers,
+// Unit, Json, RpcError, Id).
 template <class T> struct CodecOf;
+
+// How a protocol supplies codecs for ITS types, without opening namespace
+// jsonrpc and without touching any of its existing codec definitions.
+//
+// A protocol keeps its own table, `ns::CodecOf<T>`, and its types live in
+// `ns`. It writes, once, in `ns`:
+//
+//     template <class T> struct CodecOf;      // the protocol's own table
+//     JSONRPC_PROTOCOL_CODECS(CodecOf)        // let jsonrpc find it
+//
+// The macro defines a function template `jsonrpc_codec_of(T*)` in `ns`.
+// codec<T>() calls it unqualified with a `T*`, so argument-dependent lookup
+// finds it in the namespace T was declared in. A type in another namespace
+// (a test's own types) uses that namespace's table, declared the same way.
+#define JSONRPC_PROTOCOL_CODECS(Table)                                              \
+    template <class T__>                                                            \
+        requires requires { Table<T__>::get(); }                                    \
+    ::jsonrpc::Codec<T__> jsonrpc_codec_of(T__*) { return Table<T__>::get(); }
+
+namespace detail {
+template <class T>
+concept has_builtin_codec = requires { { CodecOf<T>::get() } -> std::same_as<Codec<T>>; };
+template <class T>
+concept has_protocol_codec =
+    requires(T* p) { { jsonrpc_codec_of(p) } -> std::same_as<Codec<T>>; };
+}  // namespace detail
 
 namespace detail {
 template <class T> struct is_maybe                    : std::false_type {};
@@ -79,7 +107,12 @@ Codec<T> build_codec() {
     } else if constexpr (detail::is_newtype<T>::value) {
         return newtype_codec<typename detail::is_newtype<T>::Phantom,
                              typename detail::is_newtype<T>::Carrier>();
+    } else if constexpr (detail::has_protocol_codec<T>) {
+        return jsonrpc_codec_of(static_cast<T*>(nullptr));
     } else {
+        static_assert(detail::has_builtin_codec<T>,
+                      "jsonrpc: no codec for T. Specialise your protocol's CodecOf<T> "
+                      "(declared with JSONRPC_PROTOCOL_CODECS in T's namespace).");
         return CodecOf<T>::get();
     }
 }
