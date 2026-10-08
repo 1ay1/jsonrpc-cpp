@@ -15,6 +15,7 @@
 //       enum_codec({v, "x"}, …) closed enum ⇄ string labels
 //       record(field, …)        product: named fields
 //       sum_tagged(key, arm, …) coproduct with a string discriminator
+//       variant_codec(c, …)     coproduct told apart by shape
 //
 //   Pure: codecs are immutable values. Building one allocates, so codec<T>()
 //   builds each type's codec once and hands out the same reference.
@@ -24,6 +25,7 @@
 #include <concepts>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -414,6 +416,43 @@ Codec<Sum_> sum_tagged(std::string_view tag_key, Arm<Sum_, Alts>... arms_) {
                 }(), ...);
             }, arms);
             if (!out.has_value()) throw CodecError("sum_tagged: unknown label '" + label + "'");
+            return std::move(*out);
+        }};
+}
+
+// An untagged union, told apart by shape (e.g. string | number). Encode uses
+// the active alternative's codec; decode tries each arm in order and takes
+// the first that decodes.
+template <class Sum_, class... Alts>
+Codec<Sum_> variant_codec(Codec<Alts>... arms_) {
+    auto arms = std::make_shared<std::tuple<Codec<Alts>...>>(std::move(arms_)...);
+    return {
+        [arms](const Sum_& s) -> Json {
+            Json out;
+            bool matched = false;
+            [&]<std::size_t... I>(std::index_sequence<I...>) {
+                ([&] {
+                    if (matched) return;
+                    using A = std::tuple_element_t<I, std::tuple<Alts...>>;
+                    if (const A* p = std::get_if<A>(&s)) {
+                        out = std::get<I>(*arms).encode(*p);
+                        matched = true;
+                    }
+                }(), ...);
+            }(std::index_sequence_for<Alts...>{});
+            if (!matched) throw CodecError("variant_codec: no arm for active alternative");
+            return out;
+        },
+        [arms](const Json& j) -> Sum_ {
+            Maybe<Sum_> out;
+            [&]<std::size_t... I>(std::index_sequence<I...>) {
+                ([&] {
+                    if (out.has_value()) return;
+                    try { out = Sum_{std::get<I>(*arms).decode(j)}; }
+                    catch (const CodecError&) {}
+                }(), ...);
+            }(std::index_sequence_for<Alts...>{});
+            if (!out.has_value()) throw CodecError("variant_codec: no arm decoded the value");
             return std::move(*out);
         }};
 }
