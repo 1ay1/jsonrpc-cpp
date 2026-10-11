@@ -119,7 +119,12 @@ inline std::expected<Message, Malformed> parse_one(Json j) {
     try {
         j = Json::parse(frame);
     } catch (const std::exception& e) {
-        return {std::unexpected(Malformed{Nothing, RpcError(errc::ParseError, e.what())})};
+        // The parser's message quotes the offending bytes. Invalid UTF-8 there
+        // would make the error reply itself unencodable, so keep ASCII only.
+        std::string msg = e.what();
+        for (char& c : msg)
+            if (static_cast<unsigned char>(c) >= 0x80 || static_cast<unsigned char>(c) < 0x20) c = '?';
+        return {std::unexpected(Malformed{Nothing, RpcError(errc::ParseError, std::move(msg))})};
     }
     if (!j.is_array()) return {detail::parse_one(std::move(j))};
     if (j.empty())
@@ -147,8 +152,15 @@ inline std::expected<Message, Malformed> parse_one(Json j) {
         });
 }
 
+// Encode a frame. Invalid UTF-8 anywhere in it (a tool's raw output, a file
+// name, an error quoting bytes) becomes U+FFFD rather than a throw: a frame
+// that can't be written would otherwise take down the thread writing it.
+[[nodiscard]] inline std::string dump_frame(const Json& j) {
+    return j.dump(-1, ' ', false, Json::error_handler_t::replace);
+}
+
 // The frame for a message (one line of JSON, no trailing newline).
-[[nodiscard]] inline std::string encode(const Message& m) { return to_wire(m).dump(); }
+[[nodiscard]] inline std::string encode(const Message& m) { return dump_frame(to_wire(m)); }
 
 // The error reply a Malformed earns. JSON-RPC answers with id null when the
 // id couldn't be read.
@@ -156,7 +168,7 @@ inline std::expected<Message, Malformed> parse_one(Json j) {
     Json env = {{"jsonrpc", "2.0"},
                 {"id", bad.id ? to_json(*bad.id) : Json(nullptr)},
                 {"error", to_json(bad.error)}};
-    return env.dump();
+    return dump_frame(env);
 }
 
 }  // namespace jsonrpc
